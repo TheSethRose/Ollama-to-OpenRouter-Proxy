@@ -1,0 +1,13 @@
+---
+description:
+globs:
+alwaysApply: true
+---
+# MCP Configuration Rule
+
+Configuration precedence for the proxy is as follows (see [app/main.py](mdc:app/main.py)):
+1. CLI arguments (highest priority)
+2. Environment variables (from .env or system)
+3. Hardcoded defaults
+
+All environment variables are documented in [.env.example](mdc:.env.example).

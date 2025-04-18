@@ -1,0 +1,14 @@
+---
+description:
+globs:
+alwaysApply: true
+---
+# Core Project Rule
+
+The main entry point for the proxy is [app/main.py](mdc:app/main.py). This file loads configuration from environment variables, CLI arguments, and a model filter file. All required and optional environment variables are documented in [.env.example](mdc:.env.example).
+
+- The API key for OpenRouter must be set as `OPENROUTER_API_KEY`.
+- The host, port, and model filter file path can be set via `HOST`, `PORT`, and `MODELS_FILTER` environment variables, respectively, or overridden by CLI arguments.
+- The model filter file restricts available models and is referenced in [models-filter.txt](mdc:models-filter.txt).
+
+The FastAPI app is created and routes are registered in [app/main.py](mdc:app/main.py), with endpoints implemented in [app/api.py](mdc:app/api.py).

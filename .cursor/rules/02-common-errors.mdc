@@ -1,0 +1,12 @@
+---
+description:
+globs:
+alwaysApply: true
+---
+# Common Errors Rule
+
+Common errors include:
+- Missing `OPENROUTER_API_KEY` (see [app/main.py](mdc:app/main.py) and [.env.example](mdc:.env.example)).
+- Invalid or missing model filter file (see [models-filter.txt](mdc:models-filter.txt)).
+- API errors from OpenRouter are handled and returned as JSON (see [app/api.py](mdc:app/api.py)).
+For troubleshooting, refer to [README.md](mdc:README.md) for setup and configuration guidance.

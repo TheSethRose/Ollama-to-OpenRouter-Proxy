@@ -1,0 +1,13 @@
+---
+description:
+globs:
+alwaysApply: true
+---
+# Project Context Rule
+
+This project is a FastAPI-based proxy that emulates the Ollama API and forwards requests to OpenRouter. The main API endpoints are implemented in [app/api.py](mdc:app/api.py) and described in [README.md](mdc:README.md):
+- `/api/version`: Returns the proxy version.
+- `/api/tags`: Lists available models, filtered by [models-filter.txt](mdc:models-filter.txt) if present.
+- `/api/chat`: Handles chat completions, supporting both streaming and non-streaming responses.
+
+Model filtering is controlled by the file [models-filter.txt](mdc:models-filter.txt). The proxy can be run locally or via Docker, as described in [Dockerfile](mdc:Dockerfile) and [README.md](mdc:README.md).
