@@ -41,7 +41,7 @@ Client (Ollama API) <-> [Proxy] <-> OpenRouter API
    - (Optional) Create `models-filter.txt` to restrict available models (one model name per line, e.g. `gpt-4o`).
 4. **Run the server:**
    ```sh
-   uv icorn app.main:app --host 0.0.0.0 --port 11434
+   uvicorn app.main:app --host 0.0.0.0 --port 11434
    ```
    - Use `--api-key`, `--host`, `--port`, or `--models-filter` CLI args to override defaults.
 
