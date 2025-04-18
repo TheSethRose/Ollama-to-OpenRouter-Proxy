@@ -4,3 +4,7 @@ pydantic==2.8.2
 python-dotenv==1.0.1
 uvicorn[standard]==0.30.3
 pytest==8.3.5
+websockets==15.0.1
+watchfiles==1.0.5
+
+# Testing & Quality dependencies moved to requirements-dev.txt

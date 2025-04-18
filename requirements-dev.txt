@@ -1,0 +1,5 @@
+# Development and Testing Dependencies
+pytest==8.3.5 # For running tests
+pytest-asyncio==0.26.0 # For async test support
+ruff==0.11.6 # Linter and formatter
+mypy==1.15.0 # Static type checker

@@ -111,9 +111,139 @@ Chat completion (streaming or non-streaming).
   "model": "gpt-4o:latest",
   "created_at": "...",
   "message": {"role": "assistant", "content": "Hi"},
-  "done": true
+  "done": true,
+  "total_duration": 0,
+  "load_duration": 0,
+  "prompt_eval_count": null,
+  "prompt_eval_duration": 0,
+  "eval_count": 0,
+  "eval_duration": 0
 }
 ```
+
+### `POST /api/generate`
+Text generation (streaming or non-streaming), similar to `/api/chat` but uses a single `prompt` field instead of `messages`.
+**Request:**
+```json
+{
+  "model": "gpt-4o:latest",
+  "prompt": "Why is the sky blue?",
+  "stream": false
+}
+```
+**Response (non-streaming):**
+```json
+{
+  "model": "gpt-4o:latest",
+  "created_at": "...",
+  "response": "The sky appears blue due to a phenomenon called Rayleigh scattering...",
+  "done": true,
+  "context": null,
+  "total_duration": 0,
+  "load_duration": 0,
+  "prompt_eval_count": null,
+  "prompt_eval_duration": 0,
+  "eval_count": 0,
+  "eval_duration": 0
+}
+```
+
+### `POST /api/show`
+Show model information.
+**Request:**
+```json
+{
+  "model": "gpt-4o:latest"
+}
+```
+**Response:**
+```json
+{
+  "modelfile": "",
+  "parameters": null,
+  "template": null,
+  "details": {
+    "format": "gguf",
+    "family": "openai",
+    "families": null,
+    "parameter_size": null,
+    "quantization_level": null
+  },
+  "model_info": {},
+  "modified_at": "...",
+  "projector": null
+}
+```
+
+### `GET /api/ps`
+List "running" models (synthesized from available/filtered models).
+**Response:**
+```json
+{
+  "models": [
+    {
+      "name": "gpt-4o:latest",
+      "model": "gpt-4o:latest",
+      "size": 0,
+      "digest": null,
+      "details": {
+        "format": "gguf",
+        "family": "openai",
+        "families": null,
+        "parameter_size": null,
+        "quantization_level": null
+      },
+      "expires_at": null,
+      "size_vram": 0
+    }
+  ]
+}
+```
+
+### `POST /api/embed`
+Generate embeddings for a list of inputs.
+**Request:**
+```json
+{
+  "model": "text-embedding-ada-002:latest",
+  "input": ["Hello", "World"]
+}
+```
+**Response:**
+```json
+{
+  "model": "text-embedding-ada-002:latest",
+  "embeddings": [
+    [-0.006929283495992422, ...],
+    [-0.008320334367454052, ...]
+  ]
+}
+```
+
+### `POST /api/embeddings` (Legacy)
+Generate an embedding for a single prompt.
+**Request:**
+```json
+{
+  "model": "text-embedding-ada-002:latest",
+  "prompt": "Hello world"
+}
+```
+**Response:**
+```json
+{
+  "embedding": [-0.006929283495992422, ...]
+}
+```
+
+### Unsupported Endpoints
+Requests to the following Ollama endpoints will return a `501 Not Implemented` error:
+- `/api/create`
+- `/api/copy`
+- `/api/delete`
+- `/api/pull`
+- `/api/push`
+- `/api/blobs/{digest}` (POST and HEAD)
 
 ## Model Filtering
 - If `models-filter.txt` exists, only models whose processed name (e.g., `gpt-4o`) is listed will be available via `/api/tags` and `/api/chat`.
