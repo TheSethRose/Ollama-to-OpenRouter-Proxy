@@ -1,7 +1,7 @@
 # API endpoint implementations will be added here
 
 from fastapi import APIRouter, Request, status, HTTPException
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse, PlainTextResponse, Response
 from app import models
 from app import openrouter
 from app import utils
@@ -17,29 +17,54 @@ import typing
 router = APIRouter()
 
 
+@router.head("/")
+async def head_root():
+    # Explicitly handle HEAD / to mimic Ollama's 200 OK response
+    # Return correct headers but no body
+    return Response(status_code=200, media_type="text/plain", headers={"Content-Length": "17"})
+
+
+@router.get("/")
+async def root():
+    # Return plain text like standard Ollama server
+    # This also implicitly handles HEAD / requests via FastAPI
+    return PlainTextResponse("Ollama is running")
+
+
 @router.get("/api/version")
 def api_version():
     return {"version": "0.1.0-openrouter"}
 
 
 @router.get("/api/tags")
-async def api_tags():
-    from app.main import config
+async def api_tags(request: Request):
+    # Use models and filter_set from app state
+    models_list = request.app.state.all_models
+    filter_set = request.app.state.filter_set
 
     try:
-        data = await openrouter.fetch_models(config["api_key"])
-        models_list = data.get("data", [])
-        filtered = utils.filter_models(models_list, config["filter_set"])
+        filtered = utils.filter_models(models_list, filter_set)
         now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        resp_models = [
-            models.OllamaTagModel(
-                name=utils.openrouter_id_to_ollama_name(m["id"]),
-                modified_at=now,
-                digest=None,
-                details=models.OllamaTagDetails(),
+        resp_models = []
+        for m in filtered:
+            # Use hardcoded placeholder details for compatibility
+            details = models.OllamaTagDetails(
+                format="gguf", # Hardcoded guess
+                family="openrouter", # Placeholder
+                families=["openrouter"], # Placeholder
+                parameter_size="Unknown", # Placeholder
+                quantization_level="Unknown" # Placeholder
             )
-            for m in filtered
-        ]
+
+            resp_models.append(
+                models.OllamaTagModel(
+                    name=utils.openrouter_id_to_ollama_name(m["id"]),
+                    modified_at=now,
+                    size=0, # Hardcoded placeholder
+                    digest="-", # Hardcoded placeholder
+                    details=details, # Hardcoded details
+                )
+            )
         return models.OllamaTagsResponse(models=resp_models)
     except httpx.HTTPStatusError as exc:
         raise HTTPException(status_code=exc.response.status_code, detail=str(exc))
@@ -49,18 +74,32 @@ async def api_tags():
 
 @router.post("/api/chat")
 async def api_chat(request: Request):
-    from app.main import config
+    # Access config, maps, and filter set from app state
+    api_key = request.app.state.config["api_key"]
+    ollama_map = request.app.state.ollama_to_openrouter_map
+    filter_set = request.app.state.filter_set
 
     try:
         body = await request.json()
         req = models.OllamaChatRequest(**body)
-        # Map Ollama model to OpenRouter model id
-        data = await openrouter.fetch_models(config["api_key"])
-        mapping = utils.build_ollama_to_openrouter_map(data.get("data", []))
-        openrouter_id = mapping.get(req.model)
-        if not openrouter_id:
-            return JSONResponse({"error": "Model not found"}, status_code=400)
-        # Build OpenRouter payload
+
+        # Resolve model name using the new utility function
+        resolved_ollama_name, openrouter_id = utils.resolve_model_name(req.model, ollama_map)
+
+        if not resolved_ollama_name or not openrouter_id:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Model '{req.model}' not found."
+            )
+
+        # Check against filter set if it exists
+        if filter_set and resolved_ollama_name not in filter_set:
+             raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Model '{resolved_ollama_name}' is not allowed by the filter."
+            )
+
+        # Build OpenRouter payload using resolved ID
         payload: Dict[str, Any] = {
             "model": openrouter_id,
             "messages": [m.model_dump() for m in req.messages],
@@ -78,7 +117,7 @@ async def api_chat(request: Request):
                 try:
                     buffer = ""
                     stream_iterator = await openrouter.chat_completion(
-                        config["api_key"], payload, stream=True
+                        api_key, payload, stream=True
                     )
                     try:
                         async for raw_chunk in stream_iterator:
@@ -116,7 +155,8 @@ async def api_chat(request: Request):
                                                 yield (
                                                     json.dumps(
                                                         {
-                                                            "model": req.model,
+                                                            # Use resolved name in response
+                                                            "model": resolved_ollama_name,
                                                             "created_at": now,
                                                             "message": {
                                                                 "role": "assistant",
@@ -131,7 +171,8 @@ async def api_chat(request: Request):
                                                 yield (
                                                     json.dumps(
                                                         {
-                                                            "model": req.model,
+                                                            # Use resolved name in response
+                                                            "model": resolved_ollama_name,
                                                             "created_at": now,
                                                             "message": {
                                                                 "role": "assistant",
@@ -180,11 +221,57 @@ async def api_chat(request: Request):
 
         else:  # Non-streaming path
             resp = await openrouter.chat_completion(
-                config["api_key"], payload, stream=False
+                api_key, payload, stream=False
             )
-            content = resp["choices"][0]["message"]["content"]
+
+            # -- Robustness Checks --
+            # 1. Check if OpenRouter returned an error object despite 200 OK
+            if isinstance(resp, dict) and "error" in resp:
+                error_detail = resp["error"]
+                status_code = 500 # Assume internal server error if not specified
+                if isinstance(error_detail, dict):
+                    # Try to extract code and message if possible
+                    status_code = error_detail.get("code", 500) # Use 500 if code missing
+                    error_message = error_detail.get("message", str(error_detail))
+                    # Attempt to map OpenRouter error codes to HTTP status codes if needed
+                    # e.g., if error_detail.get("code") == "invalid_request_error": status_code = 400
+                else:
+                    error_message = str(error_detail)
+
+                # Try to determine a reasonable status code if possible
+                if isinstance(status_code, str): # Handle potential non-integer codes
+                    if status_code == 'invalid_request_error':
+                        status_code = 400
+                    else:
+                         # fallback for unknown string codes
+                         status_code = 500
+                elif not isinstance(status_code, int) or status_code < 400:
+                    status_code = 500 # Default to 500 if code is missing or invalid
+
+                raise HTTPException(status_code=status_code, detail=error_message)
+
+            # 2. Check for expected structure: choices list must exist and be non-empty
+            if not isinstance(resp, dict) or "choices" not in resp or not resp["choices"]:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Unexpected non-streaming response format from OpenRouter: missing or empty 'choices'. Response: {str(resp)[:500]}"
+                )
+
+            # 3. Check structure within the first choice
+            first_choice = resp["choices"][0]
+            if "message" not in first_choice or "content" not in first_choice["message"]:
+                 raise HTTPException(
+                    status_code=500,
+                    detail=f"Unexpected non-streaming response format from OpenRouter: choice missing 'message' or 'content'. Choice: {str(first_choice)[:500]}"
+                )
+            # -- End Robustness Checks --
+
+            # If checks pass, extract content
+            content = first_choice["message"]["content"]
+
             return models.OllamaChatResponse(
-                model=req.model,
+                # Use resolved name in response
+                model=resolved_ollama_name,
                 created_at=now,
                 message=models.OllamaChatMessage(role="assistant", content=content),
                 done=True,
@@ -197,22 +284,29 @@ async def api_chat(request: Request):
 
 @router.post("/api/generate")
 async def api_generate(request: Request):
-    from app.main import config
+    # Access config, maps, and filter set from app state
+    api_key = request.app.state.config["api_key"]
+    ollama_map = request.app.state.ollama_to_openrouter_map
+    filter_set = request.app.state.filter_set
 
     try:
         body = await request.json()
         req = models.OllamaGenerateRequest(**body)
 
-        # Map Ollama model to OpenRouter model id
-        data = await openrouter.fetch_models(config["api_key"])
-        mapping = utils.build_ollama_to_openrouter_map(data.get("data", []))
-        openrouter_id = mapping.get(req.model)
-        if not openrouter_id:
-            return JSONResponse(
-                {
-                    "error": f"Model '{req.model}' not found or not supported by the proxy."
-                },
-                status_code=404,
+        # Resolve model name using the new utility function
+        resolved_ollama_name, openrouter_id = utils.resolve_model_name(req.model, ollama_map)
+
+        if not resolved_ollama_name or not openrouter_id:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Model '{req.model}' not found."
+            )
+
+        # Check against filter set if it exists
+        if filter_set and resolved_ollama_name not in filter_set:
+             raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Model '{resolved_ollama_name}' is not allowed by the filter."
             )
 
         # Build OpenRouter payload (map prompt to messages)
@@ -240,7 +334,7 @@ async def api_generate(request: Request):
                 try:
                     buffer = ""
                     stream_iterator = await openrouter.chat_completion(
-                        config["api_key"], payload, stream=True
+                        api_key, payload, stream=True
                     )
                     try:
                         async for raw_chunk in stream_iterator:
@@ -280,12 +374,13 @@ async def api_generate(request: Request):
                                                 )
                                                 yield (
                                                     json.dumps(
-                                                        models.OllamaGenerateStreamResponse(
-                                                            model=req.model,
-                                                            created_at=now,
-                                                            response=content_to_yield,
-                                                            done=False,
-                                                        ).model_dump()
+                                                        {
+                                                            # Use resolved name in response
+                                                            "model": resolved_ollama_name,
+                                                            "created_at": now,
+                                                            "response": content_to_yield,
+                                                            "done": False,
+                                                        }
                                                     )
                                                     + "\n"
                                                 )
@@ -294,22 +389,21 @@ async def api_generate(request: Request):
                                                 # Send final done message with empty response and stats
                                                 yield (
                                                     json.dumps(
-                                                        models.OllamaGenerateStreamResponse(
-                                                            model=req.model,
-                                                            created_at=now,
-                                                            response="",
-                                                            done=True,
-                                                            # Synthesized stats
-                                                            context=req.context,  # Pass context back if provided
-                                                            total_duration=0,
-                                                            load_duration=0,
-                                                            prompt_eval_count=None,  # Cannot get this from OR
-                                                            prompt_eval_duration=0,
-                                                            eval_count=len(
-                                                                full_response_content.split()
-                                                            ),  # Rough token count
-                                                            eval_duration=0,
-                                                        ).model_dump()
+                                                        {
+                                                            # Use resolved name in response
+                                                            "model": resolved_ollama_name,
+                                                            "created_at": now,
+                                                            "response": "",
+                                                            "done": True,
+                                                            # Add synthesized stats here
+                                                            "context": req.context or [],
+                                                            "total_duration": 0, # Placeholder
+                                                            "load_duration": 0, # Placeholder
+                                                            "prompt_eval_count": 0, # Placeholder
+                                                            "prompt_eval_duration": 0, # Placeholder
+                                                            "eval_count": 0, # Placeholder
+                                                            "eval_duration": 0 # Placeholder
+                                                        }
                                                     )
                                                     + "\n"
                                                 )
@@ -351,11 +445,12 @@ async def api_generate(request: Request):
 
         else:  # Non-streaming path
             resp = await openrouter.chat_completion(
-                config["api_key"], payload, stream=False
+                api_key, payload, stream=False
             )
             content = resp["choices"][0]["message"]["content"]
             return models.OllamaGenerateResponse(
-                model=req.model,
+                # Use resolved name in response
+                model=resolved_ollama_name,
                 created_at=now,
                 response=content,
                 done=True,
@@ -377,66 +472,37 @@ async def api_generate(request: Request):
 
 @router.post("/api/show")
 async def api_show(request: Request):
-    from app.main import config
+    # Access maps from app state
+    ollama_map = request.app.state.ollama_to_openrouter_map
+    openrouter_map = request.app.state.openrouter_to_ollama_map
 
     try:
         body = await request.json()
-        # logging.getLogger("ollama-proxy").info("[DEBUG] /api/show incoming request body: %s", json.dumps(body, indent=2)) # COMMENTED OUT
         req = models.OllamaShowRequest(**body)
-        # logging.getLogger("ollama-proxy").info("[DEBUG] /api/show resolved model: %s", req.model) # COMMENTED OUT
 
-        # Fetch all models and find the requested one by Ollama name
-        data = await openrouter.fetch_models(config["api_key"])
-        models_list = data.get("data", [])
-        # Need the reverse mapping to find the OpenRouter ID
-        reverse_mapping = utils.build_openrouter_to_ollama_map(models_list)
-        # Filter models based on config before searching
-        filtered_openrouter_ids = {
-            m["id"] for m in utils.filter_models(models_list, config["filter_set"])
-        }
+        # Prioritize using req.name if provided, otherwise fallback to req.model
+        name_to_resolve = req.name if req.name is not None else req.model
 
-        target_openrouter_id = None
-        target_model_data = None
+        # Use the resolve function which now handles None input
+        resolved_ollama_name, _ = utils.resolve_model_name(name_to_resolve, ollama_map)
 
-        for or_id, ollama_name in reverse_mapping.items():
-            if ollama_name == req.model:
-                target_openrouter_id = or_id
-                break
-
-        if not target_openrouter_id:
-            logging.getLogger("ollama-proxy").error("[ERROR] /api/show: Model '%s' not found in reverse mapping", req.model)
+        if not resolved_ollama_name:
+            # Provide a clearer error message indicating which name was attempted
+            attempted_name = name_to_resolve if name_to_resolve is not None else "(Not provided)"
             raise HTTPException(
-                status_code=404, detail=f"Model '{req.model}' not found."
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Model '{attempted_name}' not found."
             )
 
-        # Find the full data for the target model
-        for model_data in models_list:
-            if model_data["id"] == target_openrouter_id:
-                # Check if this model is allowed by the filter
-                if target_openrouter_id not in filtered_openrouter_ids:
-                    logging.getLogger("ollama-proxy").error("[ERROR] /api/show: Model '%s' filtered out by proxy configuration", req.model)
-                    raise HTTPException(
-                        status_code=404,
-                        detail=f"Model '{req.model}' is available upstream but filtered out by the proxy configuration.",
-                    )
-                target_model_data = model_data
-                break
-
-        if not target_model_data:
-            logging.getLogger("ollama-proxy").error("[ERROR] /api/show: Model '%s' (ID: %s) data not found upstream", req.model, target_openrouter_id)
-            raise HTTPException(
-                status_code=404,
-                detail=f"Model '{req.model}' (ID: {target_openrouter_id}) data not found upstream.",
-            )
-
-        # Synthesize the OllamaShowResponse
+        # Construct the stubbed response
+        # Note: We don't fetch specific details from OpenRouter for this endpoint
         details = models.OllamaShowDetails()
         # Attempt to extract family/parameter size from ID/name (basic)
-        if target_openrouter_id and "/" in target_openrouter_id:
-            details.family = target_openrouter_id.split("/")[0]
-        if target_openrouter_id and ":" in target_openrouter_id:
+        if resolved_ollama_name and "/" in resolved_ollama_name:
+            details.family = resolved_ollama_name.split("/")[0]
+        if resolved_ollama_name and ":" in resolved_ollama_name:
             # Very basic parsing, may not always be accurate
-            parts = target_openrouter_id.split(":")[-1]
+            parts = resolved_ollama_name.split(":")[-1]
             if "b" in parts.lower() or "m" in parts.lower():  # e.g., 7b, 8x7b, 1.5m
                 details.parameter_size = parts.upper()
 
@@ -447,8 +513,6 @@ async def api_show(request: Request):
         details.families = details.families or []
         details.parameter_size = details.parameter_size or ""
         details.quantization_level = details.quantization_level or ""
-
-        # logging.getLogger("ollama-proxy").info("[DEBUG] /api/show synthesized details: %s", json.dumps(details.model_dump(), indent=2)) # COMMENTED OUT
 
         # Synthesize model_info as empty dict (Ollama returns a populated dict, but we can't fetch this info)
         model_info = {}
@@ -467,66 +531,6 @@ async def api_show(request: Request):
             tensors=tensors,
         )
 
-        # Type validation check for all fields in the response (on the Pydantic model instance)
-        def check_types_instance(obj, model, prefix="response"):
-            if hasattr(model, 'model_fields'):  # Pydantic v2
-                fields = model.model_fields
-            elif hasattr(model, '__fields__'):  # Pydantic v1
-                fields = model.__fields__
-            else:
-                fields = {}
-            for k in fields:
-                expected_type = fields[k].annotation
-                v = getattr(obj, k, None)
-                origin = typing.get_origin(expected_type)
-                args = typing.get_args(expected_type)
-                # For nested models, recurse
-                if hasattr(fields[k], 'type_') and hasattr(fields[k].type_, 'model_fields'):
-                    if not isinstance(v, fields[k].type_):
-                        logging.getLogger("ollama-proxy").error(
-                            f"[ERROR] Type mismatch at {prefix}.{k}: expected {fields[k].type_}, got {type(v)} ({repr(v)})"
-                        )
-                    else:
-                        check_types_instance(v, fields[k].type_, f"{prefix}.{k}")
-                elif origin is list:
-                    if not isinstance(v, list):
-                        logging.getLogger("ollama-proxy").error(
-                            f"[ERROR] Type mismatch at {prefix}.{k}: expected list, got {type(v)} ({repr(v)})"
-                        )
-                    else:
-                        elem_type = args[0] if args else object
-                        for idx, item in enumerate(v):
-                            elem_origin = typing.get_origin(elem_type)
-                            if elem_origin:
-                                if not isinstance(item, elem_origin):
-                                    logging.getLogger("ollama-proxy").error(
-                                        f"[ERROR] Type mismatch at {prefix}.{k}[{idx}]: expected {elem_origin}, got {type(item)} ({repr(item)})"
-                                    )
-                                # Optionally recurse for nested generics
-                            elif not isinstance(item, elem_type):
-                                logging.getLogger("ollama-proxy").error(
-                                    f"[ERROR] Type mismatch at {prefix}.{k}[{idx}]: expected {elem_type}, got {type(item)} ({repr(item)})"
-                                )
-                elif origin is dict:
-                    if not isinstance(v, dict):
-                        logging.getLogger("ollama-proxy").error(
-                            f"[ERROR] Type mismatch at {prefix}.{k}: expected dict, got {type(v)} ({repr(v)})"
-                        )
-                elif expected_type is not None and origin is None:
-                    # Only check non-generic types
-                    if v is not None and not isinstance(v, expected_type):
-                        logging.getLogger("ollama-proxy").error(
-                            f"[ERROR] Type mismatch at {prefix}.{k}: expected {expected_type}, got {type(v)} ({repr(v)})"
-                        )
-
-        check_types_instance(response_obj, models.OllamaShowResponse)
-
-        # DEBUG: Print the full response dict for inspection - COMMENTED OUT
-        # logging.getLogger("ollama-proxy").info(
-        #     "[DEBUG] /api/show response for model '%s': %s",
-        #     req.model,
-        #     json.dumps(response_obj.model_dump(), indent=2)
-        # )
         return response_obj
 
     except httpx.HTTPStatusError as exc:
@@ -534,7 +538,7 @@ async def api_show(request: Request):
         if exc.response.status_code == 404:
             raise HTTPException(
                 status_code=404,
-                detail=f"Model '{req.model}' not found upstream at OpenRouter.",
+                detail=f"Model '{req.name}' not found upstream at OpenRouter.",
             )
         raise HTTPException(status_code=exc.response.status_code, detail=str(exc))
     except HTTPException as http_exc:  # Re-raise existing HTTPExceptions
@@ -547,148 +551,94 @@ async def api_show(request: Request):
 
 @router.get("/api/ps")
 async def api_ps():
-    from app.main import config
-
-    try:
-        data = await openrouter.fetch_models(config["api_key"])
-        models_list = data.get("data", [])
-        filtered_models_data = utils.filter_models(models_list, config["filter_set"])
-
-        running_models = []
-        for m_data in filtered_models_data:
-            ollama_name = utils.openrouter_id_to_ollama_name(m_data["id"])
-            details = models.OllamaShowDetails()  # Create default details
-            # Synthesize basic details from ID
-            if "/" in m_data["id"]:
-                details.family = m_data["id"].split("/")[0]
-            if ":" in m_data["id"]:
-                parts = m_data["id"].split(":")[-1]
-                if "b" in parts.lower() or "m" in parts.lower():
-                    details.parameter_size = parts.upper()
-
-            ps_model = models.OllamaPsModel(
-                name=ollama_name,
-                model=ollama_name,
-                digest=None,
-                details=details,
-                expires_at=None,
-            )
-            running_models.append(ps_model)
-
-        return models.OllamaPsResponse(models=running_models)
-
-    except httpx.HTTPStatusError as exc:
-        raise HTTPException(status_code=exc.response.status_code, detail=str(exc))
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+    # This endpoint provides dummy info about running models
+    # No need to access config or state for now
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    return {
+        "models": [],
+        "created_at": now,
+    }
 
 
 # --- Embeddings Endpoints ---
 
 
 async def _handle_embeddings(
-    ollama_model_name: str, input_data: str | list[str]
+    request: Request, ollama_model_name: str, input_data: str | list[str]
 ) -> dict:
-    """Core logic for handling embeddings, shared by /api/embed and /api/embeddings."""
-    from app.main import config
+    """Helper to handle shared logic for embedding endpoints."""
+    # Access config and maps from app state
+    api_key = request.app.state.config["api_key"]
+    ollama_map = request.app.state.ollama_to_openrouter_map
+    filter_set = request.app.state.filter_set
 
-    # Map Ollama model to OpenRouter model id
-    data = await openrouter.fetch_models(config["api_key"])
-    mapping = utils.build_ollama_to_openrouter_map(data.get("data", []))
-    openrouter_id = mapping.get(ollama_model_name)
+    # Resolve model name
+    resolved_ollama_name, openrouter_id = utils.resolve_model_name(
+        ollama_model_name, ollama_map
+    )
 
-    # Check if model exists and is allowed by filter
-    if not openrouter_id:
-        # Check if it *would* be available but is filtered
-        reverse_mapping = utils.build_openrouter_to_ollama_map(data.get("data", []))
-        if (
-            ollama_model_name in reverse_mapping.values()
-        ):  # Check if it exists upstream at all
-            raise HTTPException(
-                status_code=404,
-                detail=f"Model '{ollama_model_name}' is available upstream but filtered out by the proxy configuration.",
-            )
+    if not resolved_ollama_name or not openrouter_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Model '{ollama_model_name}' not found."
+        )
+
+    # Check against filter set if it exists
+    if filter_set and resolved_ollama_name not in filter_set:
+         raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Model '{resolved_ollama_name}' is not allowed by the filter."
+        )
+
+    # Check if OpenRouter actually supports embeddings for this model ID
+    # (We might need a separate check or rely on OpenRouter API error)
+    # For now, assume any resolved model might work if the API supports it.
+
+    payload = {"input": input_data, "model": openrouter_id}
+    try:
+        embedding_response = await openrouter.fetch_embeddings(api_key, payload)
+        # Transform OpenRouter response to Ollama format
+        # Assuming OpenRouter returns a list of embedding objects with an 'embedding' field
+        embeddings = [
+            item["embedding"] for item in embedding_response.get("data", [])
+        ]
+        # Ollama expects a single list for single input, list of lists for multiple
+        if isinstance(input_data, str):
+            return {"embedding": embeddings[0] if embeddings else []}
         else:
-            raise HTTPException(
-                status_code=404, detail=f"Model '{ollama_model_name}' not found."
-            )
-    else:
-        # Double check it wasn't filtered out
-        models_list = data.get("data", [])
-        filtered_openrouter_ids = {
-            m["id"] for m in utils.filter_models(models_list, config["filter_set"])
-        }
-        if openrouter_id not in filtered_openrouter_ids:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Model '{ollama_model_name}' is available upstream but filtered out by the proxy configuration.",
-            )
+            return {"embeddings": embeddings}
 
-    # OpenRouter expects 'input' to always be a list for embeddings
-    if isinstance(input_data, str):
-        input_list = [input_data]
-    else:
-        input_list = input_data
-
-    payload = {"model": openrouter_id, "input": input_list}
-
-    # Call OpenRouter
-    openrouter_response = await openrouter.fetch_embeddings(config["api_key"], payload)
-    return openrouter_response
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(status_code=exc.response.status_code, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @router.post("/api/embed")
 async def api_embed(request: Request):
+    # Uses _handle_embeddings which now takes request object
     try:
         body = await request.json()
         req = models.OllamaEmbedRequest(**body)
-
-        openrouter_response = await _handle_embeddings(req.model, req.input)
-
-        # Extract embeddings from OpenRouter response
-        # Assumes OpenAI-compatible structure: response['data'][i]['embedding']
-        embeddings_list = [
-            item["embedding"] for item in openrouter_response.get("data", [])
-        ]
-
-        return models.OllamaEmbedResponse(
-            model=req.model,  # Return the originally requested Ollama model name
-            embeddings=embeddings_list,
-        )
-
+        result = await _handle_embeddings(request, req.model, req.input)
+        return result
     except httpx.HTTPStatusError as exc:
         raise HTTPException(status_code=exc.response.status_code, detail=str(exc))
-    except HTTPException as http_exc:
-        raise http_exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
 
 @router.post("/api/embeddings")  # Older endpoint
 async def api_embeddings(request: Request):
+    # Uses _handle_embeddings which now takes request object
     try:
         body = await request.json()
         req = models.OllamaEmbeddingsRequest(**body)
-
-        # Use the shared handler, passing the prompt as a single input string
-        openrouter_response = await _handle_embeddings(req.model, req.prompt)
-
-        # Extract the first embedding from the response
-        embeddings_list = [
-            item["embedding"] for item in openrouter_response.get("data", [])
-        ]
-        if not embeddings_list:
-            # Should not happen if OpenRouter API call succeeded, but handle defensively
-            raise HTTPException(
-                status_code=500, detail="Upstream API returned no embeddings data."
-            )
-
-        return models.OllamaEmbeddingsResponse(embedding=embeddings_list[0])
-
+        # Handle both single prompt (str) and multiple prompts (list)
+        result = await _handle_embeddings(request, req.model, req.prompt)
+        return result
     except httpx.HTTPStatusError as exc:
         raise HTTPException(status_code=exc.response.status_code, detail=str(exc))
-    except HTTPException as http_exc:
-        raise http_exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 

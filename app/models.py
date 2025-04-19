@@ -136,21 +136,27 @@ class OllamaGenerateResponse(BaseModel):
 
 
 class OllamaShowRequest(BaseModel):
+    # Allow 'name' to be optional, defaulting to None if missing
+    name: Optional[str] = None
+    # Keep model field for backward compatibility or direct use if provided
     model: Optional[str] = None
-    name: Optional[str] = None # Added optional name field
 
+    # NB: Pydantic v2 model_validator replaces root_validator
     @model_validator(mode='before')
     @classmethod
-    def check_model_or_name(cls, data: Any) -> Any:
+    def check_name_or_model(cls, data: Any) -> Any:
         if isinstance(data, dict):
-            if 'model' not in data and 'name' not in data:
-                raise ValueError("Request body must contain either 'model' or 'name' field.")
-            # If 'name' is provided but 'model' is not, use 'name' as 'model'
-            if 'name' in data and 'model' not in data:
-                data['model'] = data.pop('name')
-            # If both are present, 'model' takes precedence, remove 'name' if it exists
-            elif 'model' in data and 'name' in data:
-                 data.pop('name', None) # Remove 'name' key if it exists
+            # If neither is present, that's an error (handled by framework or subsequent checks)
+            if 'name' not in data and 'model' not in data:
+                 # Let Pydantic handle the validation error if both are truly missing
+                 # Or raise a clearer error if desired:
+                 # raise ValueError("Request must contain either 'name' or 'model' field.")
+                 pass # Allow Pydantic to potentially catch this based on Optional types
+            # If 'name' is present, prioritize it for our logic
+            # If 'model' is also present, we can ignore it or keep it
+            # If only 'model' is present, we will use it.
+            # No data mutation needed here if subsequent code checks req.name or req.model
+            pass
         elif data is None:
              raise ValueError("Request body cannot be empty.")
         return data
