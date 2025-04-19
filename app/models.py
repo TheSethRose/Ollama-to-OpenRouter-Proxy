@@ -60,7 +60,7 @@ class OllamaTagDetails(BaseModel):
 class OllamaTagModel(BaseModel):
     name: str
     modified_at: str
-    size: int
+    size: Optional[int] = None
     digest: Optional[str] = None
     details: OllamaTagDetails
 
@@ -157,11 +157,18 @@ class OllamaShowRequest(BaseModel):
 
 
 class OllamaShowDetails(BaseModel):
-    format: str = "gguf"
-    family: Optional[str] = None
-    families: list[str] | None = None
-    parameter_size: Optional[str] = None
-    quantization_level: Optional[str] = None
+    parent_model: str = ""
+    format: str = ""
+    family: str = ""
+    families: list[str] = []
+    parameter_size: str = ""
+    quantization_level: str = ""
+
+
+class OllamaShowTensor(BaseModel):
+    name: str = ""
+    type: str = ""
+    shape: list[int] = []
 
 
 class OllamaShowModelInfo(BaseModel):
@@ -171,13 +178,15 @@ class OllamaShowModelInfo(BaseModel):
 
 
 class OllamaShowResponse(BaseModel):
-    modelfile: str | None = ""
-    parameters: Optional[str] = None
-    template: Optional[str] = None
-    details: OllamaShowDetails
+    license: str = ""
+    modelfile: str = ""
+    parameters: str = ""
+    template: str = ""
+    details: OllamaShowDetails = OllamaShowDetails()
     model_info: dict = {}
-    modified_at: str | None = None
-    projector: str | None = None
+    tensors: list[OllamaShowTensor] = []
+    # projector REMOVED to match Ollama
+    # modified_at is not present in Ollama's /api/show, so remove it
 
     model_config = {
         "protected_namespaces": (),
@@ -190,11 +199,11 @@ class OllamaShowResponse(BaseModel):
 class OllamaPsModel(BaseModel):
     name: str
     model: str
-    size: int
+    size: Optional[int] = None
     digest: Optional[str]
     details: OllamaShowDetails
     expires_at: Optional[str] = None
-    size_vram: int
+    size_vram: Optional[int] = None
 
 
 class OllamaPsResponse(BaseModel):

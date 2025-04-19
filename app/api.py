@@ -9,6 +9,10 @@ import time
 import json
 import httpx
 from typing import Dict, Any
+import logging
+import traceback
+from pydantic import ValidationError
+import typing
 
 router = APIRouter()
 
@@ -31,7 +35,6 @@ async def api_tags():
             models.OllamaTagModel(
                 name=utils.openrouter_id_to_ollama_name(m["id"]),
                 modified_at=now,
-                size=0,
                 digest=None,
                 details=models.OllamaTagDetails(),
             )
@@ -179,9 +182,6 @@ async def api_chat(request: Request):
             resp = await openrouter.chat_completion(
                 config["api_key"], payload, stream=False
             )
-            print(
-                f"\n--- OpenRouter Non-Streaming Response ---\n{resp}\n-----------------------------------------\n"
-            )  # DEBUG LOGGING
             content = resp["choices"][0]["message"]["content"]
             return models.OllamaChatResponse(
                 model=req.model,
@@ -353,9 +353,6 @@ async def api_generate(request: Request):
             resp = await openrouter.chat_completion(
                 config["api_key"], payload, stream=False
             )
-            print(
-                f"\n--- OpenRouter Non-Streaming /generate Response ---\n{resp}\n-----------------------------------------\n"
-            )  # DEBUG LOGGING
             content = resp["choices"][0]["message"]["content"]
             return models.OllamaGenerateResponse(
                 model=req.model,
@@ -384,7 +381,9 @@ async def api_show(request: Request):
 
     try:
         body = await request.json()
+        # logging.getLogger("ollama-proxy").info("[DEBUG] /api/show incoming request body: %s", json.dumps(body, indent=2)) # COMMENTED OUT
         req = models.OllamaShowRequest(**body)
+        # logging.getLogger("ollama-proxy").info("[DEBUG] /api/show resolved model: %s", req.model) # COMMENTED OUT
 
         # Fetch all models and find the requested one by Ollama name
         data = await openrouter.fetch_models(config["api_key"])
@@ -405,6 +404,7 @@ async def api_show(request: Request):
                 break
 
         if not target_openrouter_id:
+            logging.getLogger("ollama-proxy").error("[ERROR] /api/show: Model '%s' not found in reverse mapping", req.model)
             raise HTTPException(
                 status_code=404, detail=f"Model '{req.model}' not found."
             )
@@ -414,6 +414,7 @@ async def api_show(request: Request):
             if model_data["id"] == target_openrouter_id:
                 # Check if this model is allowed by the filter
                 if target_openrouter_id not in filtered_openrouter_ids:
+                    logging.getLogger("ollama-proxy").error("[ERROR] /api/show: Model '%s' filtered out by proxy configuration", req.model)
                     raise HTTPException(
                         status_code=404,
                         detail=f"Model '{req.model}' is available upstream but filtered out by the proxy configuration.",
@@ -422,7 +423,7 @@ async def api_show(request: Request):
                 break
 
         if not target_model_data:
-            # This case should ideally not happen if reverse_mapping is correct
+            logging.getLogger("ollama-proxy").error("[ERROR] /api/show: Model '%s' (ID: %s) data not found upstream", req.model, target_openrouter_id)
             raise HTTPException(
                 status_code=404,
                 detail=f"Model '{req.model}' (ID: {target_openrouter_id}) data not found upstream.",
@@ -439,26 +440,97 @@ async def api_show(request: Request):
             if "b" in parts.lower() or "m" in parts.lower():  # e.g., 7b, 8x7b, 1.5m
                 details.parameter_size = parts.upper()
 
-        # Use OpenRouter's created_at if available, otherwise current time
-        # OpenRouter doesn't seem to provide modified_at, use created_at or fallback
-        modified_time_str = None
-        if target_model_data:
-             modified_time_str = target_model_data.get("created_at")
-        if not modified_time_str:
-            modified_time_str = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        # Fill in details fields with empty string/list if not available
+        details.parent_model = ""
+        details.format = details.format or ""
+        details.family = details.family or ""
+        details.families = details.families or []
+        details.parameter_size = details.parameter_size or ""
+        details.quantization_level = details.quantization_level or ""
 
-        return models.OllamaShowResponse(
-            details=details,
-            modified_at=modified_time_str,
-            # model_info, modelfile, parameters, template are synthesized/empty
-            model_info={},
+        # logging.getLogger("ollama-proxy").info("[DEBUG] /api/show synthesized details: %s", json.dumps(details.model_dump(), indent=2)) # COMMENTED OUT
+
+        # Synthesize model_info as empty dict (Ollama returns a populated dict, but we can't fetch this info)
+        model_info = {}
+
+        # Synthesize tensors as empty list (Ollama returns a large list, but we can't fetch this info)
+        tensors = []
+
+        # Synthesize license, modelfile, parameters, template as empty strings
+        response_obj = models.OllamaShowResponse(
+            license="",
             modelfile="",
             parameters="",
             template="",
+            details=details,
+            model_info=model_info,
+            tensors=tensors,
         )
 
+        # Type validation check for all fields in the response (on the Pydantic model instance)
+        def check_types_instance(obj, model, prefix="response"):
+            if hasattr(model, 'model_fields'):  # Pydantic v2
+                fields = model.model_fields
+            elif hasattr(model, '__fields__'):  # Pydantic v1
+                fields = model.__fields__
+            else:
+                fields = {}
+            for k in fields:
+                expected_type = fields[k].annotation
+                v = getattr(obj, k, None)
+                origin = typing.get_origin(expected_type)
+                args = typing.get_args(expected_type)
+                # For nested models, recurse
+                if hasattr(fields[k], 'type_') and hasattr(fields[k].type_, 'model_fields'):
+                    if not isinstance(v, fields[k].type_):
+                        logging.getLogger("ollama-proxy").error(
+                            f"[ERROR] Type mismatch at {prefix}.{k}: expected {fields[k].type_}, got {type(v)} ({repr(v)})"
+                        )
+                    else:
+                        check_types_instance(v, fields[k].type_, f"{prefix}.{k}")
+                elif origin is list:
+                    if not isinstance(v, list):
+                        logging.getLogger("ollama-proxy").error(
+                            f"[ERROR] Type mismatch at {prefix}.{k}: expected list, got {type(v)} ({repr(v)})"
+                        )
+                    else:
+                        elem_type = args[0] if args else object
+                        for idx, item in enumerate(v):
+                            elem_origin = typing.get_origin(elem_type)
+                            if elem_origin:
+                                if not isinstance(item, elem_origin):
+                                    logging.getLogger("ollama-proxy").error(
+                                        f"[ERROR] Type mismatch at {prefix}.{k}[{idx}]: expected {elem_origin}, got {type(item)} ({repr(item)})"
+                                    )
+                                # Optionally recurse for nested generics
+                            elif not isinstance(item, elem_type):
+                                logging.getLogger("ollama-proxy").error(
+                                    f"[ERROR] Type mismatch at {prefix}.{k}[{idx}]: expected {elem_type}, got {type(item)} ({repr(item)})"
+                                )
+                elif origin is dict:
+                    if not isinstance(v, dict):
+                        logging.getLogger("ollama-proxy").error(
+                            f"[ERROR] Type mismatch at {prefix}.{k}: expected dict, got {type(v)} ({repr(v)})"
+                        )
+                elif expected_type is not None and origin is None:
+                    # Only check non-generic types
+                    if v is not None and not isinstance(v, expected_type):
+                        logging.getLogger("ollama-proxy").error(
+                            f"[ERROR] Type mismatch at {prefix}.{k}: expected {expected_type}, got {type(v)} ({repr(v)})"
+                        )
+
+        check_types_instance(response_obj, models.OllamaShowResponse)
+
+        # DEBUG: Print the full response dict for inspection - COMMENTED OUT
+        # logging.getLogger("ollama-proxy").info(
+        #     "[DEBUG] /api/show response for model '%s': %s",
+        #     req.model,
+        #     json.dumps(response_obj.model_dump(), indent=2)
+        # )
+        return response_obj
+
     except httpx.HTTPStatusError as exc:
-        # Handle case where the model exists in mapping but OpenRouter gives 404
+        logging.getLogger("ollama-proxy").error("[ERROR] /api/show HTTPStatusError: %s\n%s", str(exc), traceback.format_exc())
         if exc.response.status_code == 404:
             raise HTTPException(
                 status_code=404,
@@ -466,8 +538,10 @@ async def api_show(request: Request):
             )
         raise HTTPException(status_code=exc.response.status_code, detail=str(exc))
     except HTTPException as http_exc:  # Re-raise existing HTTPExceptions
+        logging.getLogger("ollama-proxy").error("[ERROR] /api/show HTTPException: %s\n%s", str(http_exc), traceback.format_exc())
         raise http_exc
     except Exception as exc:
+        logging.getLogger("ollama-proxy").error("[ERROR] /api/show Exception: %s\n%s", str(exc), traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(exc))
 
 
@@ -495,11 +569,9 @@ async def api_ps():
             ps_model = models.OllamaPsModel(
                 name=ollama_name,
                 model=ollama_name,
-                size=0,
                 digest=None,
                 details=details,
                 expires_at=None,
-                size_vram=0,
             )
             running_models.append(ps_model)
 

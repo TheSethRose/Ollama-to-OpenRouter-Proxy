@@ -254,5 +254,16 @@ Requests to the following Ollama endpoints will return a `501 Not Implemented` e
   llama-3
   ```
 
+## Updating Free Models
+
+A helper script `update-free-models.sh` is provided to automatically update `models-filter.txt` with all currently available models marked as free by OpenRouter.
+
+To use it:
+1. Ensure the proxy is running locally **without** the `--models-filter` argument or `MODELS_FILTER` environment variable set (so it lists all models).
+2. Make the script executable (if you haven't already): `chmod +x update-free-models.sh`
+3. Run the script: `./update-free-models.sh`
+
+This will fetch the full model list from `http://localhost:11435/api/tags`, filter for names containing `:free:`, sort them alphabetically, and overwrite `models-filter.txt`.
+
 ## License
 MIT
